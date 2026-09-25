@@ -1,3 +1,13 @@
+FROM node:22-slim AS atlas-frequi
+WORKDIR /ui
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+# The same upstream FreqUI 3.1.2 release previously installed by Freqtrade,
+# pinned to its source commit and built for the private portal route.
+RUN curl -fsSL https://codeload.github.com/freqtrade/frequi/tar.gz/f76ad9e7f8b6ee8e2d1f214a484d6182393be717 -o /tmp/ui.tar.gz \
+    && tar -xzf /tmp/ui.tar.gz --strip-components=1 -C /ui \
+    && npm ci && npm run build -- --base=/apps/freqtrade/
+
 FROM python:3.14.7-slim-trixie AS base
 
 # Setup env
@@ -45,8 +55,9 @@ USER ftuser
 COPY --chown=ftuser:ftuser . /freqtrade/
 
 RUN pip install -e . --user --no-cache-dir \
-  && mkdir /freqtrade/user_data/ \
-  && freqtrade install-ui
+  && mkdir /freqtrade/user_data/
+COPY --from=atlas-frequi --chown=ftuser:ftuser /ui/dist /freqtrade/freqtrade/rpc/api_server/ui/installed
+RUN printf '3.1.2-atlas' > /freqtrade/freqtrade/rpc/api_server/ui/installed/.uiversion
 
 # Initialize the Railway volume and drop privileges before importing packages
 # installed in ftuser's Python user site. CLI remains available as `freqtrade`.
