@@ -59,6 +59,7 @@ RUN pip install -e . --user --no-cache-dir \
 COPY --from=atlas-frequi --chown=ftuser:ftuser /ui/dist /freqtrade/freqtrade/rpc/api_server/ui/installed
 RUN printf '3.1.2-atlas' > /freqtrade/freqtrade/rpc/api_server/ui/installed/.uiversion
 RUN python -m unittest discover -s atlas -p 'test*.py' -v
+RUN cd /tmp && python -c "import atlas.api_handoff; import atlas.run_reviewed_backtest"
 
 # Initialize the Railway volume and drop privileges before importing packages
 # installed in ftuser's Python user site. CLI remains available as `freqtrade`.

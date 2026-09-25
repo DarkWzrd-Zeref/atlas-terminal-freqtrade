@@ -149,7 +149,7 @@ zip-safe = false
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["freqtrade*"]
+include = ["freqtrade*", "atlas"]
 exclude = ["tests", "tests.*", "user_data", "user_data*"]
 namespaces = true
 
