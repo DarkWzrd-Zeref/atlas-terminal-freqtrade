@@ -251,6 +251,15 @@ class ApiServer(RPCHandler):
                 tags=["Atlas strategy handoff"],
                 dependencies=[Depends(http_basic_or_jwt_token), Depends(is_webserver_mode)],
             )
+        if os.environ.get("ATLAS_FREQTRADE_ROLE") == "paper":
+            from atlas.api_paper import router as atlas_paper
+
+            app.include_router(
+                atlas_paper,
+                prefix="/api/v1",
+                tags=["Atlas paper selection"],
+                dependencies=[Depends(http_basic_or_jwt_token), Depends(is_trading_mode)],
+            )
         app.include_router(
             api_bg_tasks,
             prefix="/api/v1",

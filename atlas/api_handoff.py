@@ -596,6 +596,19 @@ async def backtest_candidate(digest: str, request: Request, config=Depends(_get_
         raise _error(exc) from exc
 
 
+@router.get("/atlas/candidates/{digest}/bundle")
+def candidate_bundle(digest: str, config=Depends(_get_config)):
+    """Export only reverified bytes, for an authenticated owner's explicit review."""
+    try:
+        bundle = verify_candidate(_candidate(config, digest), expected_sha256=digest)
+        return {"manifest": bundle.manifest, "sha256": bundle.sha256,
+                "reviewed_sha256": bundle.sha256,
+                "files": [{"path": path, "content_base64": base64.b64encode(content).decode("ascii")}
+                          for path, content in bundle.files]}
+    except (BundleError, OSError) as exc:
+        raise _error(exc) from exc
+
+
 @router.get("/atlas/jobs")
 def recent_backtests(limit: int = Query(MAX_JOB_LIST, ge=1, le=MAX_JOB_LIST), config=Depends(_get_config)):
     return _jobs(config).recent(limit)

@@ -82,6 +82,19 @@ class CandidateRoutes(unittest.TestCase):
             self.assertEqual(self.upload().status_code, 403)
         self.assertEqual(list(self.root.iterdir()), [])
 
+    def test_bundle_export_reverifies_exact_transport_and_hash_alias(self):
+        self.assertEqual(self.upload().status_code, 201)
+        path = f"/api/v1/atlas/candidates/{self.bundle.sha256}/bundle"
+        response = self.client.get(path, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["sha256"], self.bundle.sha256)
+        self.assertEqual(response.json()["reviewed_sha256"], self.bundle.sha256)
+        payload = response.json()
+        payload.pop("sha256")
+        self.assertEqual(api._decode_bundle(payload), self.bundle)
+        (api._storage(self.config) / ("atlas_" + self.bundle.sha256) / "ReviewedStrategy.py").write_bytes(b"modified")
+        self.assertEqual(self.client.get(path, headers=self.headers).status_code, 400)
+
     def test_native_registration_requires_both_auth_and_webserver_in_lab_only(self):
         source = Path(__file__).resolve().parents[1] / "freqtrade/rpc/api_server/webserver.py"
         tree = ast.parse(source.read_text(encoding="utf-8"))

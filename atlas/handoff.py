@@ -313,11 +313,17 @@ def install_candidate(lab_strategies: Path, bundle: ValidatedBundle, *, role: st
     """
     if role != "lab":
         raise BundleError("Candidate installation is allowed only in the isolated lab role.")
+    return _install_reviewed_bundle(lab_strategies, bundle, reviewed_sha256=reviewed_sha256)
+
+
+def _install_reviewed_bundle(root: Path, bundle: ValidatedBundle, *,
+                             reviewed_sha256: str) -> InstalledCandidate:
+    """Internal inert storage primitive; callers must enforce their deployment role."""
     checked = validate_bundle(bundle.manifest, bundle.files)
     if (not isinstance(reviewed_sha256, str) or not _DIGEST.fullmatch(reviewed_sha256)
             or not hmac.compare_digest(checked.sha256, reviewed_sha256)):
         raise BundleError("Installation requires the exact reviewed bundle digest.")
-    root = _plain_directory(Path(lab_strategies))
+    root = _plain_directory(Path(root))
     destination = root / ("atlas_" + checked.sha256)
     if destination.exists() or destination.is_symlink():
         verify_candidate(destination, expected_sha256=checked.sha256)

@@ -130,7 +130,9 @@ def main():
     env = {key: value for key, value in os.environ.items() if not key.startswith("FREQTRADE__")}
     env["FREQTRADE__DRY_RUN"] = "true"
     if role == "paper":
-        os.execvpe("freqtrade", ["freqtrade", "trade", "--config", str(runtime), "--logfile", str(data / "logs/freqtrade.log")], env)
+        from atlas.paper_supervisor import supervise_paper
+        supervise_paper(config, runtime)
+        return
     if role == "lab":
         os.execvpe("freqtrade", ["freqtrade", "webserver", "--config", str(lab_runtime)], env)
     supervise([
