@@ -7,6 +7,7 @@ import secrets
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from copy import deepcopy
 
@@ -104,6 +105,19 @@ def supervise(commands: list[list[str]], env: dict):
                 child.wait()
 
 
+def drop_privileges(data: Path):
+    if os.getuid() == 0:
+        os.chown(data, 1000, 1000)
+        os.setgroups([])
+        os.setgid(1000)
+        os.setuid(1000)
+        os.environ["HOME"] = "/home/ftuser"
+        # Python initialized root's user-site before the uid change. Re-exec
+        # before importing the supervisor so ftuser's installed packages and
+        # editable atlas package are discovered by a fresh interpreter.
+        os.execvpe(sys.executable, [sys.executable, str(Path(__file__).resolve())], dict(os.environ))
+
+
 def main():
     data = Path("/freqtrade/user_data")
     if not os.environ.get("RAILWAY_VOLUME_MOUNT_PATH"):
@@ -112,12 +126,7 @@ def main():
         raise SystemExit("Mount the Freqtrade volume at /freqtrade/user_data.")
     # Railway mounts volumes as root. Grant the existing image user access,
     # then drop root before invoking the upstream application.
-    if os.getuid() == 0:
-        os.chown(data, 1000, 1000)
-        os.setgroups([])
-        os.setgid(1000)
-        os.setuid(1000)
-        os.environ["HOME"] = "/home/ftuser"
+    drop_privileges(data)
     config = prepare_config(data, Path("/freqtrade"), os.environ)
     role = service_role(os.environ)
     runtime = data / "config.paper.runtime.json"

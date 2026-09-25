@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("atlas_start", Path(__file__).with_name("start.py"))
 entry = importlib.util.module_from_spec(spec)
@@ -9,6 +10,28 @@ spec.loader.exec_module(entry)
 
 
 class ConfigurationIsolation(unittest.TestCase):
+    def test_root_bootstrap_reexecutes_after_uid_drop_before_package_imports(self):
+        # No actual privilege or filesystem changes occur in this regression test.
+        with patch.object(entry.os, "getuid", return_value=0, create=True), \
+             patch.object(entry.os, "chown", create=True) as chown, \
+             patch.object(entry.os, "setgroups", create=True) as groups, \
+             patch.object(entry.os, "setgid", create=True) as gid, \
+             patch.object(entry.os, "setuid", create=True) as uid, \
+             patch.object(entry.os, "execvpe") as execute, \
+             patch.dict(entry.os.environ, {"HOME": "/root"}):
+            entry.drop_privileges(Path("/freqtrade/user_data"))
+            chown.assert_called_once_with(Path("/freqtrade/user_data"), 1000, 1000)
+            groups.assert_called_once_with([])
+            gid.assert_called_once_with(1000)
+            uid.assert_called_once_with(1000)
+            self.assertEqual(execute.call_args.args[:2],
+                             (entry.sys.executable, [entry.sys.executable, str(Path(entry.__file__).resolve())]))
+            self.assertEqual(execute.call_args.args[2]["HOME"], "/home/ftuser")
+        with patch.object(entry.os, "getuid", return_value=1000, create=True), \
+             patch.object(entry.os, "execvpe") as execute:
+            entry.drop_privileges(Path("/freqtrade/user_data"))
+            execute.assert_not_called()
+
     def test_restarts_retain_credentials_and_lab_cannot_replace_paper_strategy(self):
         source = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as folder:
