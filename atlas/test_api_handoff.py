@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from unittest.mock import patch
 
@@ -138,6 +139,138 @@ class CandidateRoutes(unittest.TestCase):
                 response = self.client.post(f"/api/v1/atlas/candidates/{self.bundle.sha256}/backtest",
                                             json=body, headers=self.headers)
                 self.assertEqual(response.status_code, 400)
+
+    def test_history_list_requires_auth_lab_role_and_bounded_limit(self):
+        self.assertEqual(self.client.get("/api/v1/atlas/jobs").status_code, 401)
+        with patch.dict(os.environ, {"ATLAS_FREQTRADE_ROLE": "paper"}):
+            self.assertEqual(self.client.get("/api/v1/atlas/jobs", headers=self.headers).status_code, 403)
+        for limit in ("0", "51", "not-an-integer"):
+            self.assertEqual(self.client.get("/api/v1/atlas/jobs?limit=" + limit, headers=self.headers).status_code, 422)
+        manager = api.CandidateJobs(self.root)
+        record = save_job_record(manager, 1, status="completed")
+        with patch.object(api, "_jobs", return_value=manager):
+            response = self.client.get("/api/v1/atlas/jobs?limit=1", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["jobs"][0]["job_id"], record["job_id"])
+        self.assertNotIn("log_tail", response.json()["jobs"][0])
+
+    def test_result_route_passes_existing_zip_filename_to_native_history_loader(self):
+        manager = api.CandidateJobs(self.root)
+        record = save_job_record(manager, 1, status="completed")
+        native = types.ModuleType("freqtrade.rpc.api_server.api_backtest")
+        calls = []
+
+        def native_result(filename, strategy, config):
+            calls.append((filename, strategy, config))
+            return {"status": "ended", "running": False, "backtest_result": {"fixture": True}}
+
+        native.api_backtest_history_result = native_result
+        with patch.object(api, "_jobs", return_value=manager), patch.dict(sys.modules, {native.__name__: native}):
+            response = self.client.get(f"/api/v1/atlas/jobs/{record['job_id']}/result", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(calls, [("backtest-result-fixture.zip", "ReviewedStrategy", self.config)])
+
+
+def save_job_record(manager, number, *, status="completed"):
+    job_id = f"{number:032x}"
+    directory = manager.root / job_id
+    directory.mkdir()
+    record = {"job_id": job_id, "candidate_sha256": "a" * 64, "strategy": "ReviewedStrategy",
+              "status": status, "running": status == "running", "exit_code": 0 if status == "completed" else None,
+              "started_at": "2026-09-25T00:00:00+00:00", "finished_at": None,
+              "result_filename": "backtest-result-fixture.zip" if status == "completed" else None,
+              "error": None, "log_tail": "A log must not be copied into list responses.",
+              "settings": {"timerange": "20260924-20260925", "timeframe": "5m"},
+              "status_url": f"/api/v1/atlas/jobs/{job_id}", "result_url": f"/api/v1/atlas/jobs/{job_id}/result"}
+    path = directory / "job.json"
+    path.write_text(json.dumps(record), encoding="utf-8")
+    os.utime(path, ns=(number * 1000000000, number * 1000000000))
+    return record
+
+
+class PersistedJobHistory(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.manager = api.CandidateJobs(self.root)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_recent_records_keep_hash_interval_and_recover_interrupted_jobs(self):
+        completed = save_job_record(self.manager, 1)
+        running = save_job_record(self.manager, 2, status="running")
+        restarted = api.CandidateJobs(self.root)
+        history = restarted.recent()
+        self.assertEqual([job["job_id"] for job in history["jobs"]], [running["job_id"], completed["job_id"]])
+        self.assertEqual(history["jobs"][0]["status"], "interrupted")
+        self.assertFalse(history["jobs"][0]["running"])
+        self.assertEqual(history["jobs"][1]["status"], "completed")
+        self.assertEqual(history["jobs"][1]["candidate_sha256"], "a" * 64)
+        self.assertEqual(history["jobs"][1]["settings"]["timerange"], "20260924-20260925")
+        self.assertEqual(history["jobs"][1]["result_filename"], "backtest-result-fixture.zip")
+        self.assertFalse(history["truncated"])
+        self.assertTrue(all("log_tail" not in job for job in history["jobs"]))
+
+    def test_live_job_is_recovered_as_running_not_interrupted(self):
+        record = save_job_record(self.manager, 1, status="running")
+        self.manager.active = record["job_id"]
+        self.manager.live = record
+        history = self.manager.recent()
+        self.assertEqual(history["jobs"][0]["status"], "running")
+        self.assertTrue(history["jobs"][0]["running"])
+
+    def test_fifty_most_recent_records_and_scan_caps_are_explicit(self):
+        for number in range(1, 56):
+            save_job_record(self.manager, number)
+        history = self.manager.recent()
+        self.assertEqual(len(history["jobs"]), 50)
+        self.assertEqual(history["jobs"][0]["job_id"], f"{55:032x}")
+        self.assertEqual(history["jobs"][-1]["job_id"], f"{6:032x}")
+        self.assertTrue(history["truncated"])
+        with patch.object(api, "MAX_JOB_SCAN", 3):
+            capped = self.manager.recent()
+        self.assertEqual(capped["scanned"], 3)
+        self.assertLessEqual(len(capped["jobs"]), 3)
+        self.assertTrue(capped["truncated"])
+        with patch.object(api, "MAX_JOB_RECORD_READS", 2):
+            bounded_reads = self.manager.recent()
+        self.assertEqual(len(bounded_reads["jobs"]), 2)
+        self.assertTrue(bounded_reads["truncated"])
+
+    def test_corrupt_and_mismatched_records_do_not_hide_valid_history(self):
+        valid = save_job_record(self.manager, 1)
+        corrupt = save_job_record(self.manager, 2)
+        mismatch = save_job_record(self.manager, 3)
+        (self.manager.root / corrupt["job_id"] / "job.json").write_text("{broken")
+        mismatch["job_id"] = "../outside"
+        (self.manager.root / f"{3:032x}" / "job.json").write_text(json.dumps(mismatch))
+        history = self.manager.recent()
+        self.assertEqual([job["job_id"] for job in history["jobs"]], [valid["job_id"]])
+        self.assertEqual(history["unreadable"], 2)
+        for job_id in (corrupt["job_id"], f"{3:032x}"):
+            with self.assertRaises(HTTPException) as raised:
+                self.manager.status(job_id)
+            self.assertEqual(raised.exception.status_code, 409)
+        with self.assertRaises(HTTPException) as raised:
+            self.manager.status("../outside")
+        self.assertEqual(raised.exception.status_code, 404)
+
+    def test_symlinked_job_directory_is_never_followed(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        job_id = "d" * 32
+        (outside / "job.json").write_text(json.dumps({"job_id": job_id, "private": "must not be read"}))
+        try:
+            (self.manager.root / job_id).symlink_to(outside, target_is_directory=True)
+        except OSError:
+            self.skipTest("Symlink creation requires privileges on this platform")
+        history = self.manager.recent()
+        self.assertEqual(history["jobs"], [])
+        self.assertEqual(history["unreadable"], 1)
+        with self.assertRaises(HTTPException) as raised:
+            self.manager.status(job_id)
+        self.assertEqual(raised.exception.status_code, 409)
 
 
 _CHILD_FIXTURE = """

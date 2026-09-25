@@ -20,17 +20,18 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import signal
+import stat
 import subprocess
 import sys
 import threading
 import time
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from atlas.handoff import (
     BundleError, MANIFEST_NAME, MAX_BUNDLE_BYTES, MAX_FILE_BYTES, MAX_FILES,
-    MAX_MANIFEST_BYTES, _plain_directory, _read_regular, install_candidate,
+    MAX_MANIFEST_BYTES, _link, _plain_directory, _read_regular, install_candidate,
     parse_manifest_json, validate_bundle, verify_candidate,
 )
 
@@ -38,6 +39,9 @@ from atlas.handoff import (
 MAX_REQUEST_BYTES = ((MAX_BUNDLE_BYTES + 2) // 3) * 4 + 2 * MAX_MANIFEST_BYTES
 MAX_LOG_BYTES = 16384
 BACKTEST_TIMEOUT_SECONDS = 1800
+MAX_JOB_SCAN = 2048
+MAX_JOB_LIST = 50
+MAX_JOB_RECORD_READS = 100
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _JOB_ID = re.compile(r"[0-9a-f]{32}\Z")
 _CLOSED_RANGE = re.compile(r"(?:\d{8}(?:T\d{4}(?:\d{2})?)?|\d{10}|\d{13})-(?:\d{8}(?:T\d{4}(?:\d{2})?)?|\d{10}|\d{13})\Z")
@@ -423,20 +427,84 @@ class CandidateJobs:
                     _native_busy(release=True)
 
     def status(self, job_id):
-        if not _JOB_ID.fullmatch(job_id):
+        if not isinstance(job_id, str) or not _JOB_ID.fullmatch(job_id):
             raise HTTPException(status_code=404, detail="Backtest job not found.")
         with self.lock:
             if self.active == job_id:
                 return {**self.live, "log_tail": _clean_log(b"".join(self.log), self.secrets)}
-            path = self.root / job_id / "job.json"
             try:
+                directory = _plain_directory(self.root / job_id)
+                path = directory / "job.json"
                 record = json.loads(_read_regular(path, 256 * 1024))
             except FileNotFoundError:
                 raise HTTPException(status_code=404, detail="Backtest job not found.")
+            except (BundleError, OSError, ValueError, UnicodeError, RecursionError) as exc:
+                raise HTTPException(status_code=409, detail="Saved backtest metadata cannot be read.") from exc
+            if not isinstance(record, dict) or record.get("job_id") != job_id:
+                raise HTTPException(status_code=409, detail="Saved backtest metadata has an invalid job identity.")
             if record.get("running"):
                 record.update(status="interrupted", running=False,
                               error="The lab restarted before this job recorded completion.")
             return record
+
+    def recent(self, limit=MAX_JOB_LIST):
+        """List recent persisted activity with bounded scan, reads and response size.
+
+        Sorting uses job.json modification time, which advances at completion.
+        When the directory scan or response cap is reached, truncated is true:
+        the response must not be described as an exhaustive history in that case.
+        """
+        if type(limit) is not int or not 1 <= limit <= MAX_JOB_LIST:
+            raise HTTPException(status_code=400, detail="Job list limit must be between 1 and 50.")
+        try:
+            root = _plain_directory(self.root)
+            eligible = []
+            scanned = unreadable = 0
+            truncated = False
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    if scanned >= MAX_JOB_SCAN:
+                        truncated = True
+                        break
+                    scanned += 1
+                    if not _JOB_ID.fullmatch(entry.name):
+                        continue
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                        if _link(info) or not stat.S_ISDIR(info.st_mode):
+                            unreadable += 1
+                            continue
+                        saved = Path(entry.path) / "job.json"
+                        saved_info = saved.lstat()
+                        if _link(saved_info) or not stat.S_ISREG(saved_info.st_mode):
+                            unreadable += 1
+                            continue
+                        eligible.append((saved_info.st_mtime_ns, entry.name))
+                    except OSError:
+                        unreadable += 1
+            # The active owner-controlled job must remain recoverable even if
+            # old files exhaust the bounded directory scan.
+            with self.lock:
+                active = self.active
+            if active and all(job_id != active for _, job_id in eligible):
+                eligible.append((time.time_ns(), active))
+            eligible.sort(reverse=True)
+            jobs = []
+            inspected = 0
+            for _, job_id in eligible:
+                if len(jobs) >= limit or inspected >= MAX_JOB_RECORD_READS:
+                    truncated = True
+                    break
+                inspected += 1
+                try:
+                    record = self.status(job_id)
+                except HTTPException:
+                    unreadable += 1
+                    continue
+                jobs.append({key: value for key, value in record.items() if key != "log_tail"})
+            return {"jobs": jobs, "truncated": truncated, "scanned": scanned, "unreadable": unreadable}
+        except (BundleError, OSError) as exc:
+            raise HTTPException(status_code=409, detail="Saved backtest history cannot be listed.") from exc
 
     def stop(self):
         with self.lock:
@@ -526,6 +594,11 @@ async def backtest_candidate(digest: str, request: Request, config=Depends(_get_
         return _jobs(config).start(directory, digest, options, config)
     except (BundleError, OSError) as exc:
         raise _error(exc) from exc
+
+
+@router.get("/atlas/jobs")
+def recent_backtests(limit: int = Query(MAX_JOB_LIST, ge=1, le=MAX_JOB_LIST), config=Depends(_get_config)):
+    return _jobs(config).recent(limit)
 
 
 @router.get("/atlas/jobs/{job_id}")
