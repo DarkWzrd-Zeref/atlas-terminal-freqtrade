@@ -37,7 +37,7 @@ def prepare_config(data: Path, source: Path, environ: dict) -> dict:
     return config
 
 
-def prepare_lab_config(paper: dict, data: Path) -> dict:
+def prepare_lab_config(paper: dict, data: Path, port: int = 8081) -> dict:
     """Native webserver mode exposes Freqtrade's own backtests and downloads.
 
     Keep lab strategies/results separate from the running paper allocation.
@@ -52,9 +52,21 @@ def prepare_lab_config(paper: dict, data: Path) -> dict:
     config = deepcopy(paper)
     config["user_data_dir"] = str(lab)
     config["db_url"] = "sqlite:///" + str(lab / "unused-paper.sqlite")
-    config["api_server"]["listen_port"] = 8081
+    config["api_server"]["listen_port"] = port
     config["bot_name"] = "Atlas Strategy Lab"
+    # A candidate's native timeframe must not be silently overridden by the
+    # initial paper bot's five-minute configuration.
+    config.pop("timeframe", None)
     return config
+
+
+def service_role(environ: dict) -> str:
+    # Combined mode is retained only during the non-destructive migration of
+    # the existing lab data. Deployed roles switch to paper/lab separately.
+    role = environ.get("ATLAS_FREQTRADE_ROLE", "combined")
+    if role not in ("paper", "lab", "combined"):
+        raise ValueError("ATLAS_FREQTRADE_ROLE must be paper, lab or combined")
+    return role
 
 
 def write_config(path: Path, config: dict):
@@ -107,14 +119,20 @@ def main():
         os.setuid(1000)
         os.environ["HOME"] = "/home/ftuser"
     config = prepare_config(data, Path("/freqtrade"), os.environ)
+    role = service_role(os.environ)
     runtime = data / "config.paper.runtime.json"
     write_config(runtime, config)
     lab_runtime = data / "config.lab.runtime.json"
-    write_config(lab_runtime, prepare_lab_config(config, data))
+    if role != "paper":
+        write_config(lab_runtime, prepare_lab_config(config, data, int(os.environ.get("PORT", "8080")) if role == "lab" else 8081))
     # Environment overrides must not turn this deployment into a live bot or
     # inject exchange keys. Configuration changes belong to a reviewed release.
     env = {key: value for key, value in os.environ.items() if not key.startswith("FREQTRADE__")}
     env["FREQTRADE__DRY_RUN"] = "true"
+    if role == "paper":
+        os.execvpe("freqtrade", ["freqtrade", "trade", "--config", str(runtime), "--logfile", str(data / "logs/freqtrade.log")], env)
+    if role == "lab":
+        os.execvpe("freqtrade", ["freqtrade", "webserver", "--config", str(lab_runtime)], env)
     supervise([
         ["freqtrade", "trade", "--config", str(runtime), "--logfile", str(data / "logs/freqtrade.log")],
         ["freqtrade", "webserver", "--config", str(lab_runtime)],
