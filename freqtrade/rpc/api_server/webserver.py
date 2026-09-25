@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 from ipaddress import ip_address
 from typing import Any
@@ -241,6 +242,15 @@ class ApiServer(RPCHandler):
             tags=["Backtest"],
             dependencies=[Depends(http_basic_or_jwt_token), Depends(is_webserver_mode)],
         )
+        if os.environ.get("ATLAS_FREQTRADE_ROLE") == "lab":
+            from atlas.api_handoff import router as atlas_handoff
+
+            app.include_router(
+                atlas_handoff,
+                prefix="/api/v1",
+                tags=["Atlas strategy handoff"],
+                dependencies=[Depends(http_basic_or_jwt_token), Depends(is_webserver_mode)],
+            )
         app.include_router(
             api_bg_tasks,
             prefix="/api/v1",
