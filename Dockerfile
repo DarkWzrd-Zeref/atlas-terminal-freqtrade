@@ -48,6 +48,7 @@ RUN pip install -e . --user --no-cache-dir \
   && mkdir /freqtrade/user_data/ \
   && freqtrade install-ui
 
-ENTRYPOINT ["freqtrade"]
-# Default to trade mode
-CMD [ "trade" ]
+# Initialize the Railway volume and drop privileges before importing packages
+# installed in ftuser's Python user site. CLI remains available as `freqtrade`.
+ENTRYPOINT []
+CMD ["python", "/freqtrade/atlas/start.py"]
