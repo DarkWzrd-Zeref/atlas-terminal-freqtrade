@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 # pinned to its source commit and built for the private portal route.
 RUN curl -fsSL https://codeload.github.com/freqtrade/frequi/tar.gz/f76ad9e7f8b6ee8e2d1f214a484d6182393be717 -o /tmp/ui.tar.gz \
     && tar -xzf /tmp/ui.tar.gz --strip-components=1 -C /ui \
-    && npm ci && npm run build -- --base=/apps/freqtrade/
+    && corepack enable && pnpm install --frozen-lockfile && pnpm build --base=/apps/freqtrade/
 
 FROM python:3.14.7-slim-trixie AS base
 
